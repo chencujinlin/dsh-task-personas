@@ -1,0 +1,42 @@
+/** IM 会话标识：与网页任务分列。DSH 会话头不能写 origin=im，只靠 id 前缀。 */
+export declare const IM_ORIGIN = "im";
+export declare const IM_SESSION_PREFIX = "im:";
+export type ChannelId = 'dingtalk' | 'feishu' | 'lark' | 'weixin' | 'wecom' | 'qq' | 'telegram' | 'discord' | 'slack';
+/** 运行实例 ID。旧版首个账号仍可直接使用渠道 ID，新账号使用 `<channel>_<stable>`。 */
+export type ChannelInstanceId = string;
+export type ChatKind = 'dm' | 'group';
+export interface SessionRecord {
+    /** 已通过 Host 接入的会话；恢复时不能套用机器人默认配置。 */
+    adopted?: boolean;
+    /** 静音：保留登记但不向聊天投递该会话的输出事件。 */
+    muted?: boolean;
+    /** 已解除投递关系；保留历史元数据，防止启动恢复重新登记。 */
+    detached?: boolean;
+    agentPreset?: string;
+    /** 创建或接续时的工作区，轮换不跟随账号默认值漂移。 */
+    cwd?: string;
+    sessionId: string;
+    channel: ChannelInstanceId;
+    kind: ChatKind;
+    chatId: string;
+    title: string;
+    /** pending 仅用于新会话占位名称；缺省表示旧数据来源未知。 */
+    titleSource?: 'pending' | 'message' | 'host' | 'user';
+    updatedAt: string;
+}
+export declare function sessionKeyOf(channel: ChannelInstanceId, kind: ChatKind, chatId: string): string;
+/** 新建会话用带时间戳的唯一 id；同一毫秒连续创建会递增，避免撞上已归档记录。 */
+export declare function createImSessionId(channel: ChannelInstanceId, kind: ChatKind, chatId: string, now?: number): string;
+export declare function isImSessionId(sessionId: string): boolean;
+export declare function parseImSessionId(sessionId: string): {
+    channel: ChannelInstanceId;
+    kind: ChatKind;
+    chatId: string;
+} | undefined;
+export declare function isImOrigin(origin: string | undefined): boolean;
+/** 任务列表可见：排除 IM 与子 agent。 */
+export declare function isTaskSession(input: {
+    id?: string;
+    origin?: string;
+    blank?: boolean;
+}): boolean;

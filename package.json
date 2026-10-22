@@ -1,0 +1,70 @@
+{
+  "name": "dsh-task-personas",
+  "version": "0.7.0",
+  "description": "DSH 会话独立人格、飞书表情与主动聊天",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "roles",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check lib/index.js && node --check lib/personas.js && node --check lib/stickers.js && node --check lib/client.js && node --check lib/social.js && node --check lib/groups.js",
+    "test:privacy": "node scripts/check-public.mjs",
+    "check:bridge": "npm --prefix im-connect run check"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=22",
+    "dsh": "0.2.1-rc.2"
+  },
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chencujinlin/dsh-task-personas.git"
+  },
+  "homepage": "https://github.com/chencujinlin/dsh-task-personas#readme",
+  "bugs": {
+    "url": "https://github.com/chencujinlin/dsh-task-personas/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "feishu",
+    "persona",
+    "im-connect"
+  ],
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-scope": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
+    "@deepseek-ai/schemastery": "3.18.5"
+  }
+}

@@ -1,0 +1,166 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, writeFileSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir, homedir } from 'node:os';
+import { join } from 'node:path';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
+import { createServer } from 'node:http';
+import { once } from 'node:events';
+import { PersonaStore } from '../lib/personas.js';
+import { StickerLibrary, StickerBridge, imageInfo, MAX_IMAGE_BYTES, registerStickerApi, STICKER_API } from '../lib/stickers.js';
+const GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aL1sAAAAASUVORK5CYII=', 'base64');
+function fixture(t) {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-stickers-test-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const bindings = {
+    first: { channel: 'feishu_account', sessionId: 'first', chatId: 'chat-a', kind: 'dm' },
+    second: { channel: 'feishu_account', sessionId: 'second', chatId: 'chat-b', kind: 'group' },
+    'history:old': { channel: 'feishu_account', sessionId: 'old', chatId: 'chat-a', kind: 'dm' },
+  };
+  const library = new StickerLibrary(home, { readBindings: () => bindings });
+  const store = new PersonaStore(join(home, 'task-personas', 'sessions.json'));
+  const bridge = new StickerBridge({}, store, library);
+  return { home, bindings, library, store, bridge };
+}
+test('image import preserves GIF and PNG bytes and enforces platform limits', t => {
+  const { library } = fixture(t);
+  assert.equal(imageInfo(GIF).mime, 'image/gif');
+  const item = library.addImage(GIF, { name: '收到', description: '回复收到、同意' });
+  assert.deepEqual(library.bytes('first', item.id).data, GIF);
+  assert.equal(imageInfo(PNG).width, 1);
+  assert.throws(() => imageInfo(Buffer.from('<svg></svg>')), /仅支持/);
+  assert.throws(() => imageInfo(Buffer.alloc(MAX_IMAGE_BYTES + 1)), /10 MB/);
+  const huge = Buffer.from(GIF); huge.writeUInt16LE(2001, 6);
+  assert.throws(() => imageInfo(huge), /2000/);
+});
+test('manual imports are shared; received images and native stickers require collection and stay in their chat', t => {
+  const { home, bindings, library } = fixture(t);
+  const shared = library.addImage(PNG, { name: '赞' });
+  library.captureIncoming({ accountId: 'feishu_account', chatId: 'chat-a', kind: 'dm', media: [{ kind: 'image', data: GIF }], stickerKey: 'private-native-key' });
+  assert.deepEqual(library.list('second').map(x => x.id), [shared.id]);
+  assert.equal(library.list('first', false).length, 2);
+  assert.equal(library.list('old', false).length, 0);
+  assert.equal(library.list('normal', false).length, 0);
+  const received = library.list('first', false).find(x => x.kind === 'image');
+  assert.throws(() => library.collect('second', received.id, '坏', ''), /无法访问/);
+  library.collect('first', received.id, '开心', '表示开心');
+  library.captureIncoming({ accountId: 'feishu_account', chatId: 'chat-a', kind: 'dm', media: [{ kind: 'image', data: GIF }] });
+  assert.equal(library.items[received.id].name, '开心');
+  assert.equal(library.list('first').length, 2);
+  assert.equal(library.list('second').length, 1);
+  const native = library.list('first', false)[0];
+  const summary = library.summary(native);
+  assert.ok(!JSON.stringify(summary).includes('private-native-key'));
+  assert.equal(summary.mime, null);
+  const restored = new StickerLibrary(home, { readBindings: () => bindings });
+  assert.equal(restored.list('first').length, 2);
+  assert.deepEqual(restored.bytes('first', received.id).data, GIF);
+  library.remove('first', native.id);
+  assert.equal(library.list('first', false).length, 0);
+});
+test('failed library writes preserve metadata and remove uncommitted assets; corrupt files are retained', t => {
+  const { home, library } = fixture(t);
+  const first = library.addImage(PNG, { name: '原名' });
+  const before = readFileSync(library.file);
+  library.writer = () => { throw new Error('disk full'); };
+  assert.throws(() => library.collect('first', first.id, '新名', ''), /disk full/);
+  assert.equal(library.items[first.id].name, '原名');
+  assert.deepEqual(readFileSync(library.file), before);
+  assert.throws(() => library.addImage(GIF), /disk full/);
+  assert.equal(readdirSync(join(library.dir, 'assets')).length, 1);
+  writeFileSync(library.file, 'original broken file');
+  const broken = new StickerLibrary(home);
+  assert.ok(broken.error);
+  assert.throws(() => broken.addImage(GIF), /已保留/);
+  assert.equal(readFileSync(library.file, 'utf8'), 'original broken file');
+});
+test('send uses the bound recipient, requires persona and collection, respects cancellation and limits, and rechecks before delivery', async t => {
+  const { library, bindings, store, bridge } = fixture(t);
+  const item = library.addImage(GIF, { name: '挥手' });
+  const calls = [];
+  bridge.registerTransport('feishu_account', { async sendImage(chatId, file, signal, check) { check(); calls.push({ chatId, data: file.data }); return { messageId: 'msg-1' }; } });
+  const signal = new AbortController().signal;
+  await assert.rejects(bridge.send('first', item.id, signal), /未启用人格/);
+  store.set('first', 'whale'); store.set('second', 'tsundere'); store.set('normal', 'whale');
+  await assert.rejects(bridge.send('normal', item.id, signal), /表情不属于/);
+  await assert.rejects(bridge.send('first', item.id, AbortSignal.abort()), /abort/i);
+  assert.equal((await bridge.send('first', item.id, signal)).sent, true);
+  assert.equal(calls[0].chatId, 'chat-a'); assert.deepEqual(calls[0].data, GIF);
+  await bridge.send('first', item.id, signal);
+  await assert.rejects(bridge.send('first', item.id, signal), /每分钟/);
+  bridge.registerTransport('feishu_account', { async sendImage(_chat, _file, _signal, check) { bindings.second.chatId = 'changed'; check(); throw new Error('must not reach'); } });
+  await assert.rejects(bridge.send('second', item.id, signal), /发送已取消/);
+});
+test('SDK request details never appear in a failed model-facing send result', async t => {
+  const { library, store, bridge } = fixture(t);
+  const item = library.addImage(GIF);
+  store.set('first', 'whale');
+  bridge.registerTransport('feishu_account', { async sendImage() { throw new Error('fake-secret-in-request-config'); } });
+  await assert.rejects(bridge.send('first', item.id, new AbortController().signal), error => {
+    assert.match(error.message, /发送未确认/);
+    assert.ok(!error.message.includes('fake-secret'));
+    return true;
+  });
+});
+test('actual DSH tool runtime scopes tools to an enabled Feishu agent and removes them when disabled', async t => {
+  const require = createRequire(import.meta.url);
+  const paths = process.env.DSH_SDK_ROOT ? [process.env.DSH_SDK_ROOT] : [new URL('../', import.meta.url).pathname];
+  const load = name => import(pathToFileURL(require.resolve(name, { paths })).href);
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: Tools } = await load('@deepseek-ai/dsh-tools');
+  const { createScope } = await load('@deepseek-ai/dsh-scope');
+  const { bridge, store, library } = fixture(t);
+  const { default: SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt');
+  const ctx = new Context(); await ctx.plugin(SystemPrompt); await ctx.plugin(Tools);
+  const first = { id: 'first' }, second = { id: 'second' }, normal = { id: 'normal' };
+  for (const agent of [first, second, normal]) agent.ctx = createScope(ctx, agent).ctx;
+  t.after(async () => { await bridge.dispose(); await ctx.fiber.dispose(); });
+  store.set('first', 'whale'); store.set('normal', 'whale');
+  library.captureIncoming({ accountId: 'feishu_account', chatId: 'chat-a', kind: 'dm', stickerKey: 'received-secret-key' });
+  const native = library.list('first', false)[0]; library.collect('first', native.id, '好耶', '开心');
+  await bridge.refreshAgent(first); await bridge.refreshAgent(second); await bridge.refreshAgent(normal);
+  assert.deepEqual(ctx.tools.schemas(first).map(x => x.name).sort(), ['feishu_list_stickers', 'feishu_send_sticker']);
+  assert.deepEqual(ctx.tools.schemas(second), []); assert.deepEqual(ctx.tools.schemas(normal), []);
+  const result = await ctx.tools.execute({ callId: 'test-list', name: 'feishu_list_stickers', arguments: {}, agent: first, signal: new AbortController().signal });
+  assert.equal(result.isError, false, JSON.stringify(result));
+  assert.ok(!JSON.stringify(result).includes('received-secret-key'));
+  assert.match(JSON.stringify(result), /好耶/);
+  const forbidden = await ctx.tools.execute({ callId: 'bad-list', name: 'feishu_list_stickers', arguments: {}, agent: second, signal: new AbortController().signal });
+  assert.equal(forbidden.isError, true);
+  store.set('first', null); await bridge.refreshAgent(first);
+  assert.deepEqual(ctx.tools.schemas(first), []);
+});
+test('library HTTP route authenticates reads and writes, validates CSRF and prevents cross-chat access', async t => {
+  const { library, bridge } = fixture(t);
+  let route;
+  registerStickerApi({ webServer: { register(r) { route = r; return () => {}; } }, effect(fn) { fn(); },
+    connection: { requestRejection(req) { return req.headers.cookie === 'local-test' ? undefined : 401; } } }, bridge);
+  const server = createServer((req, res) => route.handler(req, res)); server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const base = `http://127.0.0.1:${server.address().port}${STICKER_API}`;
+  const headers = { cookie: 'local-test', 'content-type': 'application/json', 'x-dsh-task-personas-client': '1' };
+  assert.equal((await fetch(`${base}?sessionId=first`)).status, 401);
+  const body = { sessionId: 'first', data: GIF.toString('base64'), name: '收到' };
+  assert.equal((await fetch(`${base}/upload`, { method: 'POST', headers: { cookie: 'local-test' }, body: JSON.stringify(body) })).status, 403);
+  assert.equal((await fetch(`${base}/upload`, { method: 'POST', headers, body: JSON.stringify({ ...body, sessionId: 'normal' }) })).status, 400);
+  const uploaded = await fetch(`${base}/upload`, { method: 'POST', headers, body: JSON.stringify(body) });
+  assert.equal(uploaded.status, 200); const id = (await uploaded.json()).item.id;
+  const downloaded = await fetch(`${base}/image?sessionId=first&id=${id}`, { headers });
+  assert.equal(downloaded.headers.get('content-type'), 'image/gif'); assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()), GIF);
+  library.captureIncoming({ accountId: 'feishu_account', chatId: 'chat-a', kind: 'dm', media: [{ kind: 'image', data: PNG }] });
+  const candidate = library.list('first', false)[0];
+  assert.equal((await fetch(`${base}/image?sessionId=second&id=${candidate.id}`, { headers })).status, 400);
+  const writer = library.writer;
+  library.writer = () => { throw Object.assign(new Error('EACCES /private/internal/path'), { code: 'EACCES' }); };
+  const failed = await fetch(`${base}/collect`, { method: 'POST', headers, body: JSON.stringify({ sessionId: 'first', id, name: 'new name' }) });
+  assert.equal(failed.status, 503);
+  const failure = await failed.json();
+  assert.match(failure.error, /原收藏已保留/);
+  assert.ok(!failure.error.includes('/private/'));
+  assert.equal(library.items[id].name, '收到');
+  library.writer = writer;
+  const removed = await fetch(`${base}/remove`, { method: 'POST', headers, body: JSON.stringify({ sessionId: 'first', id }) });
+  assert.equal(removed.status, 200); assert.ok(!library.items[id]);
+});

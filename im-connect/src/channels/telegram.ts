@@ -1,0 +1,493 @@
+import { choiceSendError } from '../engine/choice-delivery.js'
+import { DeliveryRejected } from '../engine/deferred-delivery.js'
+import { notice } from '../engine/command-locale.js'
+import { diagnosticJson, DiagnosticError, probe, requireDiagnostic } from './diagnostics.js'
+import type { ChannelAdapter, ImMedia, ImMessage, ReplyStream } from '../engine/types.js'
+import { fileForm, fileRequest } from './file-send.js'
+import { JsonStateFile } from '../engine/json-state.js'
+import { sleepWithSignal, timeoutSignal } from '../engine/abort.js'
+import { fileMedia, imageMedia, MAX_CHANNEL_IMAGE_BYTES } from './channel-image-download.js'
+
+export interface TelegramConfig {
+  token?: string
+  stateDir?: string
+  host?: { get(name: string): unknown }
+}
+
+interface TgUpdate {
+  update_id: number
+  callback_query?: {
+    id: string
+    data?: string
+    from: { id: number }
+    message?: {
+      message_id: number
+      chat: { id: number; type: string }
+      message_thread_id?: number
+    }
+  }
+  message?: {
+    message_id: number
+    chat: { id: number; type: string }
+    from?: { id: number; username?: string; first_name?: string; is_bot?: boolean }
+    text?: string
+    caption?: string
+    media_group_id?: string
+    photo?: Array<{ file_id: string; width: number; height: number; file_size?: number }>
+    document?: { file_id: string; mime_type?: string; file_name?: string; file_size?: number }
+    entities?: Array<{ type: string; offset: number; length: number }>
+    caption_entities?: Array<{ type: string; offset: number; length: number }>
+    reply_to_message?: { from?: { id: number } }
+    message_thread_id?: number
+  }
+}
+
+const API = 'https://api.telegram.org'
+
+/**
+ * 编码 Telegram 会话键：
+ * 普通私聊 / 群聊保持 "<chatId>"；
+ * 论坛 / 话题群组（Forum / Topics）携带 threadId 时编码为 "<chatId>:<threadId>"。
+ */
+export function telegramChatId(chatId: string | number, threadId?: number): string {
+  return threadId !== undefined ? `${chatId}:${threadId}` : String(chatId)
+}
+
+/**
+ * 解码 Telegram 会话键：
+ * 分割出基础 chat_id 以及可选的 message_thread_id。
+ */
+export function parseTelegramChatId(chatId: string): { chatId: number | string; threadId?: number } {
+  const index = chatId.indexOf(':')
+  if (index < 0) {
+    const num = Number(chatId)
+    return { chatId: Number.isSafeInteger(num) ? num : chatId, threadId: undefined }
+  }
+  const idPart = chatId.slice(0, index)
+  const num = Number(idPart)
+  const rawThread = chatId.slice(index + 1)
+  return {
+    chatId: Number.isSafeInteger(num) ? num : idPart,
+    threadId: /^[1-9]\d*$/.test(rawThread) ? Number(rawThread) : undefined,
+  }
+}
+
+const FENCE_LINE = /^\s{0,3}(?:`{3,}|~{3,})/
+/** 块级语法行：列表、标题、引用、表格都不需要也不应该补硬换行。 */
+const BLOCK_LINE = /^\s{0,3}(?:#{1,6}\s|[-*+]\s|\d{1,9}[.)]\s|>|\|)/
+
+/**
+ * Rich Message 的 Markdown 由 Telegram 服务端解析，单个换行是 CommonMark 软换行，
+ * 会被折成空格。这里给普通正文行补上行尾硬换行标记（两个空格），保留逐行排版；
+ * 代码围栏、列表、标题、引用和表格属于块级语法，保持原样。
+ */
+export function toTelegramHardBreaks(value: string): string {
+  const lines = (value ?? '').split('\n')
+  const out: string[] = []
+  let inCode = false
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? ''
+    if (FENCE_LINE.test(line)) {
+      inCode = !inCode
+      out.push(line)
+      continue
+    }
+    const next = lines[index + 1]
+    const plain = !inCode && line.trim() !== '' && !BLOCK_LINE.test(line)
+    // 已经有硬换行标记（两个空格或行尾反斜杠）的行不重复添加。
+    const marked = / {2,}$/.test(line) || line.endsWith('\\')
+    out.push(plain && !marked && next !== undefined && next.trim() !== '' ? `${line}  ` : line)
+  }
+  return out.join('\n')
+}
+
+/**
+ * Rich message 的 markdown 也会解析 HTML 标签，所以先把实体转义，
+ * 避免模型原样输出被当成 Telegram 标记。围栏不闭合时返回 undefined，
+ * 交给纯文本发送，不把半截代码块当富文本发出去。
+ */
+export function toTelegramRichMarkdown(value: string): string | undefined {
+  const text = (value ?? '').trim()
+  if (!text) return undefined
+  const fences = text.split('\n').filter((line) => FENCE_LINE.test(line)).length
+  if (fences % 2 !== 0) return undefined
+  return toTelegramHardBreaks(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+export function createTelegramChannel(config: TelegramConfig, log: (line: string) => void): ChannelAdapter | undefined {
+  const token = config.token?.trim()
+  if (!token) return undefined
+  const cursorFile = new JsonStateFile(config.stateDir ? `${config.stateDir.replace(/[\\/]$/, '')}/cursor.json` : '', { offset: 0 })
+  const persist = Boolean(config.stateDir)
+
+  let handler: ((msg: ImMessage) => void | Promise<void>) | undefined
+  let offset = persist ? cursorFile.read().offset : 0
+  let stopped = false
+  let lastError = ''
+  let botId = ''
+  let username = ''
+  let lifecycle: AbortController | undefined
+  let pollTask: Promise<void> | undefined
+  // Only metadata is buffered until an album member mentions this bot. Scope
+  // admission to chat + sender + album, and bound both lifetime and entry count.
+  const albumAccess = new Map<string, { expires: number; addressed: boolean; pending: TgUpdate[]; count: number }>()
+
+  // Rich message 是较新的 Bot API 方法；一旦确认不可用就一直走纯文本，避免每条消息都先失败一次。
+  let richDisabled = false
+
+  function richUnsupported(error: unknown): boolean {
+    const status = Number((error as { status?: number } | undefined)?.status)
+    if (status === 404) return true
+    return /not found|unknown method|unsupported/i.test(error instanceof Error ? error.message : '')
+  }
+
+  async function sendMessageText(chatId: string, text: string): Promise<void> {
+    const route = parseTelegramChatId(chatId)
+    const threadParam = route.threadId !== undefined ? { message_thread_id: route.threadId } : {}
+    const markdown = richDisabled ? undefined : toTelegramRichMarkdown(text)
+    if (markdown !== undefined) {
+      try {
+        await api('sendRichMessage', { chat_id: route.chatId, ...threadParam, rich_message: { markdown } })
+        return
+      } catch (error) {
+        // 响应超时或连接中断时，原消息可能已经送达，不能再发一份。
+        if ((error as { rejected?: boolean })?.rejected !== true) throw error
+        // 限流时再发一次纯文本只会再被限流，直接交给上层退避重试。
+        if (error instanceof DeliveryRejected) throw error
+        if (richUnsupported(error)) richDisabled = true
+      }
+    }
+    await api('sendMessage', { chat_id: route.chatId, ...threadParam, text })
+  }
+
+  async function api<T>(method: string, body: Record<string, unknown>, timeoutMs = 30_000): Promise<T> {
+    const res = await fetch(`${API}/bot${token}/${method}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: timeoutSignal(timeoutMs, lifecycle?.signal),
+    })
+    const data = (await res.json()) as { ok: boolean; description?: string; error_code?: number; result: T }
+    if (!data.ok) {
+      const message = `telegram ${method}: ${data.description ?? 'unknown'}`
+      // 429 表示平台因限流未受理该请求，重发不会重复。
+      const error = Object.assign(data.error_code === 429 ? new DeliveryRejected(message) : new Error(message), { status: data.error_code, rejected: true })
+      if (data.error_code === 401) (error as Error & { code?: string }).code = 'telegram-401'
+      throw error
+    }
+    return data.result
+  }
+
+  function mentioned(message: NonNullable<TgUpdate['message']>): boolean {
+    const text = message.text ?? message.caption
+    const entities = message.text !== undefined ? message.entities : message.caption_entities
+    if (!username || !text || !Array.isArray(entities)) return false
+    return entities.some((entity) => {
+      if (entity.type !== 'mention') return false
+      return text.slice(entity.offset, entity.offset + entity.length).toLowerCase() === `@${username.toLowerCase()}`
+    })
+  }
+
+  async function downloadImages(message: NonNullable<TgUpdate['message']>): Promise<ImMedia[]> {
+    const photo = message.photo?.length ? message.photo.reduce((best, candidate) => candidate.width * candidate.height > best.width * best.height ? candidate : best) : undefined
+    const document = message.document
+    const image = photo ?? document
+    if (!image) return []
+    if ((image.file_size ?? 0) > MAX_CHANNEL_IMAGE_BYTES) throw new Error('图片超过大小限制')
+    const file = await api<{ file_path?: string; file_size?: number }>('getFile', { file_id: image.file_id })
+    if (!file.file_path || !/^[a-zA-Z0-9_/-]+\.[a-zA-Z0-9]+$/.test(file.file_path)
+      || file.file_path.split('/').some(part => !part || part === '.' || part === '..')
+      || (file.file_size ?? 0) > MAX_CHANNEL_IMAGE_BYTES) throw new Error('图片文件无效或超过大小限制')
+    // The bot token must never follow a redirect or a caller-provided download URL.
+    const response = await fetch(`${API}/file/bot${token}/${file.file_path}`, {
+      redirect: 'error', signal: timeoutSignal(30_000, lifecycle?.signal),
+    })
+    if (!response.ok || !response.body) throw new Error('图片下载失败')
+    const reader = response.body.getReader()
+    const chunks: Uint8Array[] = []
+    let size = 0
+    try {
+      if (Number(response.headers.get('content-length')) > MAX_CHANNEL_IMAGE_BYTES) throw new Error('图片超过大小限制')
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        size += value.length
+        if (size > MAX_CHANNEL_IMAGE_BYTES) throw new Error('图片超过大小限制')
+        chunks.push(value)
+      }
+      const media = document && !document.mime_type?.startsWith('image/') ? fileMedia(Buffer.concat(chunks), document.file_name) : imageMedia(Buffer.concat(chunks))
+      const name = document?.file_name?.replace(/\\/g, '/').split('/').pop()
+      return [{ ...media, ...(name ? { name } : {}) }]
+    } finally {
+      await reader.cancel().catch(() => undefined)
+      reader.releaseLock()
+    }
+  }
+
+  async function pollLoop(): Promise<void> {
+    while (!stopped) {
+      try {
+        const updates = await api<TgUpdate[]>('getUpdates', {
+          offset,
+          timeout: 25,
+          allowed_updates: ['message', 'callback_query'],
+        }, 35_000)
+        lastError = ''
+        for (const update of updates) {
+          if (stopped) break
+          // Telegram offset 是 at-most-once 取舍：先确认游标可避免崩溃重启后重复驱动 agent，代价是极端情况下丢一条未完成消息。
+          offset = update.update_id + 1
+          if (persist) cursorFile.write({ offset })
+          if (update.callback_query) {
+            const callback = update.callback_query
+            await api('answerCallbackQuery', { callback_query_id: callback.id }).catch(() => log('[telegram] 按钮回执失败'))
+            if (callback.data && callback.message) await handler?.({
+              chatId: telegramChatId(callback.message.chat.id, callback.message.message_thread_id),
+              userId: String(callback.from.id),
+              kind: callback.message.chat.type === 'private' ? 'dm' : 'group',
+              addressed: true,
+              text: '',
+              actionToken: callback.data,
+              messageId: `callback:${callback.id}`,
+            })
+            continue
+          }
+          const message = update.message
+          if (!message || message.from?.is_bot) continue
+          if (!['private', 'group', 'supergroup'].includes(message.chat.type)) continue
+          const direct = message.chat.type === 'private'
+          let addressed = direct
+            || String(message.reply_to_message?.from?.id ?? '') === botId
+            || mentioned(message)
+          let deliveries = [update]
+          if (!direct && message.media_group_id && message.from?.id) {
+            const now = Date.now()
+            for (const [key, album] of albumAccess) if (album.expires <= now) albumAccess.delete(key)
+            const key = `${message.chat.id}:${message.from.id}:${message.media_group_id}`
+            let album = albumAccess.get(key)
+            if (!album) {
+              if (albumAccess.size >= 64) albumAccess.delete(albumAccess.keys().next().value!)
+              album = { expires: now + 30_000, addressed: false, pending: [], count: 0 }
+              albumAccess.set(key, album)
+            }
+            album.addressed ||= addressed
+            addressed = album.addressed
+            if (++album.count > 20) {
+              album.pending = []
+              if (addressed) {
+                const threadParam = message.message_thread_id !== undefined ? { message_thread_id: message.message_thread_id } : {}
+                await api('sendMessage', { chat_id: message.chat.id, ...threadParam, text: config.host ? notice(config.host, '相册图片过多，请分批发送。') : '相册图片过多，请分批发送。' }).catch(() => undefined)
+              }
+              continue
+            }
+            if (!addressed) { album.pending.push(update); continue }
+            deliveries = [...album.pending, update]
+            album.pending = []
+          }
+          for (const delivery of deliveries) {
+            if (stopped) break
+            const message = delivery.message!
+            let text = message.text ?? message.caption ?? ''
+            if (username) text = text.replace(new RegExp(`@${username}\\b`, 'ig'), '').trim()
+            let media: ImMedia[] = []
+            if (addressed) {
+              try { media = await downloadImages(message) }
+              catch {
+                if (stopped) break
+                // Do not expose a token-bearing download URL through error messages.
+                log('[telegram] 图片接收失败')
+                const threadParam = message.message_thread_id !== undefined ? { message_thread_id: message.message_thread_id } : {}
+                await api('sendMessage', { chat_id: message.chat.id, ...threadParam, text: config.host ? notice(config.host, '图片接收失败，请检查图片格式和大小后重新发送完整消息。') : '图片接收失败，请检查图片格式和大小后重新发送完整消息。' }).catch(() => log('[telegram] 图片失败提示发送失败'))
+                // A failed image caption must never turn into a text command.
+                continue
+              }
+            }
+            if (stopped) break
+            void handler?.({
+              chatId: telegramChatId(message.chat.id, message.message_thread_id),
+              userId: message.from ? String(message.from.id) : undefined,
+              username: message.from?.username ?? message.from?.first_name,
+              text,
+              ...(media.length ? { media } : {}),
+              kind: direct ? 'dm' : 'group',
+              addressed,
+              messageId: String(delivery.update_id),
+            })
+          }
+        }
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error)
+        log(`[telegram] 轮询错误: ${lastError}`)
+        if (stopped) break
+        await sleepWithSignal(3000, lifecycle?.signal).catch(() => undefined)
+      }
+    }
+  }
+
+  return {
+    id: 'telegram',
+    label: 'Telegram',
+    maxMessageLength: 4000,
+    async start() {
+      albumAccess.clear()
+      lifecycle?.abort()
+      lifecycle = new AbortController()
+      stopped = false
+      const me = await api<{ id: number; username?: string; is_bot: boolean }>('getMe', {})
+      botId = String(me.id)
+      username = me.username ?? ''
+      const hook = await api<{ url?: string }>('getWebhookInfo', {})
+      if (hook.url) throw Object.assign(new Error('该 Telegram 机器人已配置 Webhook，请先在原服务中移除。'), { code: 'webhook-configured' })
+      log('[telegram] 开始长轮询')
+      pollTask = pollLoop().catch((error) => {
+        if (!stopped) log(`[telegram] 轮询循环退出: ${error instanceof Error ? error.message : String(error)}`)
+      })
+    },
+    async stop() {
+      stopped = true
+      albumAccess.clear()
+      lifecycle?.abort()
+      await pollTask?.catch(() => undefined)
+      pollTask = undefined
+      lifecycle = undefined
+      if (persist) cursorFile.write({ offset })
+    },
+    canDeliverDeferred() { return !stopped },
+    async send(chatId, text) {
+      await sendMessageText(chatId, text)
+    },
+    async sendFile(chatId, file, signal) {
+      const route = parseTelegramChatId(chatId)
+      const form = fileForm(file, 'document')
+      form.append('chat_id', String(route.chatId))
+      if (route.threadId !== undefined) {
+        form.append('message_thread_id', String(route.threadId))
+      }
+      await fileRequest(`${API}/bot${token}/sendDocument`, { method: 'POST', body: form, signal: timeoutSignal(120_000, AbortSignal.any([...(signal ? [signal] : []), ...(lifecycle ? [lifecycle.signal] : [])])) })
+    },
+    async sendChoices(message, text, buttons) {
+      const route = parseTelegramChatId(message.chatId)
+      const threadParam = route.threadId !== undefined ? { message_thread_id: route.threadId } : {}
+      const sent = await api<{ message_id: number }>('sendMessage', {
+        chat_id: route.chatId,
+        ...threadParam,
+        text,
+        reply_markup: { inline_keyboard: buttons.map(button => [{ text: button.label.slice(0, 60), callback_data: button.token }]) },
+      }).catch(error => { throw choiceSendError(error) })
+      if (!Number.isSafeInteger(sent?.message_id)) return
+      return { close: async (status: string) => {
+        await api('editMessageText', { chat_id: route.chatId, message_id: sent.message_id, text: `${text}\n\n${status}`, reply_markup: { inline_keyboard: [] } })
+      } }
+    },
+    typingIntervalMs: 5000,
+    async addStatusReaction(message, state, _label, signal) {
+      if (!message.messageId || state === 'cancelled') return
+      const route = parseTelegramChatId(message.chatId)
+      const emoji = (state === 'success' || state === 'ended') ? '👍' : state === 'error' ? '👎' : state === 'waiting' ? '🤔' : '👀'
+      await fileRequest(`${API}/bot${token}/setMessageReaction`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, signal,
+        body: JSON.stringify({ chat_id: route.chatId, message_id: Number(message.messageId), reaction: [{ type: 'emoji', emoji }] }),
+      })
+      return emoji
+    },
+    async removeStatusReaction(message, _reaction, signal) {
+      const route = parseTelegramChatId(message.chatId)
+      await fileRequest(`${API}/bot${token}/setMessageReaction`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, signal,
+        body: JSON.stringify({ chat_id: route.chatId, message_id: Number(message.messageId), reaction: [] }),
+      })
+    },
+    async sendAction(chatId) {
+      const route = parseTelegramChatId(chatId)
+      const threadParam = route.threadId !== undefined ? { message_thread_id: route.threadId } : {}
+      await api('sendChatAction', { chat_id: route.chatId, ...threadParam, action: 'typing' }).catch(() => undefined)
+    },
+    async beginReply(chatId): Promise<ReplyStream> {
+      const route = parseTelegramChatId(chatId)
+      const threadParam = route.threadId !== undefined ? { message_thread_id: route.threadId } : {}
+      const first = await api<{ message_id: number }>('sendMessage', { chat_id: route.chatId, ...threadParam, text: '…' })
+      let last = '…'
+      let timer: ReturnType<typeof setTimeout> | undefined
+      let pending: string | undefined
+      let inflight = Promise.resolve()
+
+      const flush = async (text: string, allowSend: boolean) => {
+        const next = [...text].slice(0, 4000).join('') || '…'
+        if (next === last) return
+        // last 只在发送成功后更新：失败时保留旧值，finish 才能靠 sendMessage 兜底送出全文
+        try {
+          const markdown = richDisabled ? undefined : toTelegramRichMarkdown(next)
+          if (markdown !== undefined) {
+            try {
+              await api('editMessageText', { chat_id: route.chatId, message_id: first.message_id, rich_message: { markdown } })
+              last = next
+              return
+            } catch (error) {
+              // 富文本被拒就退回纯文本编辑；确认方法不可用后不再重试。
+              if (richUnsupported(error)) richDisabled = true
+              else if (!(error instanceof Error && error.message.includes('message is not modified'))) {
+                await api('editMessageText', { chat_id: route.chatId, message_id: first.message_id, text: next })
+                last = next
+                return
+              }
+            }
+          }
+          await api('editMessageText', { chat_id: route.chatId, message_id: first.message_id, text: next })
+          last = next
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error)
+          if (detail.includes('message is not modified')) {
+            last = next
+            return
+          }
+          if (!allowSend) return
+          await sendMessageText(chatId, next)
+          last = next
+        }
+      }
+
+      return {
+        async update(text) {
+          pending = text
+          if (timer) return
+          timer = setTimeout(() => {
+            timer = undefined
+            const next = pending
+            pending = undefined
+            if (next !== undefined) inflight = inflight.then(() => flush(next, false))
+          }, 400)
+        },
+        async finish(text) {
+          if (timer) {
+            clearTimeout(timer)
+            timer = undefined
+          }
+          await inflight.catch(() => undefined)
+          const chars = [...(text || pending || last)]
+          await flush(chars.slice(0, 4000).join(''), true)
+          // 首段更新原气泡，剩余正文依次发送；全部确认后上层才将完整正文记为已送达。
+          for (let offset = 4000; offset < chars.length; offset += 4000) {
+            await sendMessageText(chatId, chars.slice(offset, offset + 4000).join(''))
+          }
+        },
+      }
+    },
+    setMessageHandler(h) { handler = h },
+    async diagnose(signal) {
+      const query = async (method: string) => {
+        const data = await diagnosticJson(`${API}/bot${token}/${method}`, signal, {})
+        if (data.ok === false) throw new DiagnosticError(data.error_code === 401 ? 'auth' : 'rejected', undefined, typeof data.error_code === 'number' ? data.error_code : undefined)
+        requireDiagnostic(data.ok === true && data.result && typeof data.result === 'object')
+        return data.result as Record<string, unknown>
+      }
+      const identity = await probe('bot', signal, async () => { const bot = await query('getMe'); requireDiagnostic(bot.id && bot.is_bot === true) })
+      if (identity.status !== 'passed') return [identity]
+      return [identity, await probe('webhook', signal, async () => {
+        const webhook = await query('getWebhookInfo')
+        requireDiagnostic(typeof webhook.url === 'string')
+        if (webhook.url) throw new DiagnosticError('webhook-conflict')
+      })]
+    },
+    status() { return stopped ? '已停止' : lastError ? '轮询异常（详情见本机日志）' : '轮询中' },
+  }
+}

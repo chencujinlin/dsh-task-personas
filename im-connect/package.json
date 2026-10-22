@@ -1,0 +1,104 @@
+{
+  "name": "@michengai/dsh-im-connect",
+  "version": "1.0.8-personas.6",
+  "description": "DSH IM Connect 本地扩展：飞书原生文本气泡与会话表情包桥接（基于 1.0.8）",
+  "type": "module",
+  "packageManager": "pnpm@11.22.0",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "locale",
+    "lib",
+    "src",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "LOCAL_CHANGES.md",
+    "UPSTREAM_NOTICE.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chencujinlin/dsh-task-personas.git",
+    "directory": "im-connect"
+  },
+  "bugs": {
+    "url": "https://github.com/chencujinlin/dsh-task-personas/issues"
+  },
+  "homepage": "https://github.com/chencujinlin/dsh-task-personas/tree/main/im-connect",
+  "scripts": {
+    "check": "node --check lib/index.js && node --check lib/channels/feishu.js && node --check lib/channels/factory.js && node --check lib/client.js && node --check lib/engine/gateway.js && node --check lib/engine/deferred-delivery.js && node --check lib/engine/persona-chat.js",
+    "test": "node --test ../tests/feishu-transport.test.mjs"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.36.0",
+    "@tencent-connect/qqbot-connector": "^1.2.0",
+    "@wecom/aibot-node-sdk": "^1.0.7",
+    "dingtalk-stream": "^2.1.4",
+    "qrcode": "^1.5.4",
+    "@deepseek-ai/schemastery": "3.18.5"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.1 || 0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-locale": "0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.1 || 0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.1 || 0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-settings": "0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.1 || 0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.1 || 0.2.1-rc.2",
+    "@deepseek-ai/dsh-host-webserver": "0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.1 || 0.2.1-rc.2",
+    "react": "^18.2.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-locale": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-settings": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-host-webserver": "0.2.1-rc.2",
+    "@types/node": "^22.10.0",
+    "@types/qrcode": "^1.5.6",
+    "esbuild": "^0.25.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "5.9.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-primitives",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "private": true
+}

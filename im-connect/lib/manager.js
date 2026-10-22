@@ -1,0 +1,1325 @@
+import { replyText } from './engine/command-locale.js';
+import { normalizeCommandPermissions } from './engine/command-permissions.js';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { createChannelAdapter } from './channels/factory.js';
+import { connectionState } from './channels/connection-state.js';
+import { DiagnosticError, probe } from './channels/diagnostics.js';
+import { fileOperation } from './engine/abort.js';
+import { parseAdditionalImageHosts } from './channels/image-host-policy.js';
+import { CHANNEL_META, CHANNEL_ORDER, supportsQr } from './channels/meta.js';
+import { PairingHub } from './channels/qr/hub.js';
+import { SessionMapStore } from './engine/session-store.js';
+import { createFileVault, createServiceVault, credentialRef } from './engine/credentials.js';
+import { ImEngine } from './engine/gateway.js';
+import { SeenStore } from './engine/seen-store.js';
+import { clearWeixinLogin, persistWeixinLogin, readLegacyWeixinBotToken, readWeixinAllowedUserId } from './channels/weixin.js';
+import { normalizeAssistantModel, normalizePermission, normalizeWorkspacePath } from './engine/assistant-settings.js';
+import { KeyedSerialQueue } from './engine/keyed-queue.js';
+import { backupCorruptFileSync, writeFileAtomicSync } from './engine/atomic-file.js';
+import { sameWorkspacePath } from './engine/workspace-path.js';
+export const API_CLIENT_HEADER = 'x-dsh-im-connect-client';
+const MAX_API_BODY_BYTES = 1024 * 1024;
+const ACCOUNT_REMARK_LIMIT = 40;
+/** 消息发送方式只有排队与插话两档；缺失或未知值一律回到排队，保持旧配置语义。 */
+function normalizeSendMode(input) {
+    return input === 'steer' ? 'steer' : 'queue';
+}
+function channelAutoPrefix(platform) {
+    return `${CHANNEL_META[platform].label}账号`;
+}
+function parseAutoOrdinal(platform, name) {
+    const trimmed = String(name ?? '').trim();
+    const prefix = channelAutoPrefix(platform);
+    if (trimmed === prefix)
+        return 1;
+    if (!trimmed.startsWith(`${prefix} `))
+        return undefined;
+    const suffix = trimmed.slice(prefix.length + 1);
+    if (!/^\d+$/.test(suffix))
+        return undefined;
+    const ordinal = Number(suffix);
+    return Number.isSafeInteger(ordinal) && ordinal >= 1 ? ordinal : undefined;
+}
+function autoAccountName(platform, ordinal) {
+    return `${channelAutoPrefix(platform)} ${ordinal}`;
+}
+class ApiRequestError extends Error {
+    status;
+    constructor(status, message) {
+        super(message);
+        this.status = status;
+    }
+}
+/** 宿主负责身份认证；插件仍限制写请求格式，避免简单跨站表单与错误载荷。 */
+function validateApiMutation(request) {
+    const method = (request.method ?? 'GET').toUpperCase();
+    if (method === 'GET' || method === 'HEAD')
+        return undefined;
+    const markerValue = request.headers[API_CLIENT_HEADER];
+    const marker = Array.isArray(markerValue) ? markerValue[0] : markerValue;
+    if (marker !== '1')
+        return { status: 403, error: 'forbidden mutation request' };
+    const typeValue = request.headers['content-type'];
+    const contentType = String(Array.isArray(typeValue) ? typeValue[0] ?? '' : typeValue ?? '').split(';', 1)[0].trim().toLowerCase();
+    if (contentType !== 'application/json')
+        return { status: 415, error: 'content-type must be application/json' };
+    return undefined;
+}
+/** 累计原始字节后一次性解码，避免 UTF-8 多字节字符跨 data chunk 时被替换字符破坏。 */
+export function readApiJsonBody(req, maxBodyBytes = MAX_API_BODY_BYTES) {
+    return new Promise((resolve) => {
+        const chunks = [];
+        let bytes = 0;
+        let oversized = false;
+        let settled = false;
+        const finish = (result) => {
+            if (settled)
+                return;
+            settled = true;
+            resolve(result);
+        };
+        // 超限后停止累计但不掐断连接，等 end 后统一按 413 拒绝，防止内存被撑爆
+        req.on('data', (chunk) => {
+            if (oversized)
+                return;
+            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            bytes += buffer.length;
+            if (bytes > maxBodyBytes) {
+                oversized = true;
+                chunks.length = 0;
+                return;
+            }
+            chunks.push(buffer);
+        });
+        req.on('error', () => finish({ body: {}, oversized, invalidJson: true }));
+        req.on('end', () => {
+            if (oversized) {
+                finish({ body: {}, oversized: true, invalidJson: false });
+                return;
+            }
+            try {
+                const raw = Buffer.concat(chunks, bytes).toString('utf8');
+                const parsed = raw ? JSON.parse(raw) : {};
+                const valid = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed);
+                finish({ body: valid ? parsed : {}, oversized: false, invalidJson: !valid });
+            }
+            catch {
+                finish({ body: {}, oversized: false, invalidJson: true });
+            }
+        });
+    });
+}
+/** 把不可解析的配置移走后再回到空配置，避免下一次 flush 覆盖唯一副本。 */
+export function backupCorruptConfig(file) {
+    return backupCorruptFileSync(file);
+}
+export class ChannelManager {
+    file;
+    stateDir;
+    sessions;
+    engine;
+    vault;
+    pairing;
+    log;
+    ctx;
+    engineConfig;
+    store = { channels: {}, allowlist: {}, pending: {} };
+    running = new Map();
+    diagnosticJobs = new Map();
+    diagnosticAbort = new AbortController();
+    channelOperations = new KeyedSerialQueue();
+    apiDisposers = [];
+    // dispose 后阻止 initEnabled/startOne 再拉起渠道，避免插件重载时新旧双实例并存
+    disposed = false;
+    constructor(options) {
+        this.ctx = options.ctx;
+        this.engineConfig = options.engineConfig;
+        this.stateDir = options.stateDir;
+        this.file = join(options.stateDir, 'channels.json');
+        this.sessions = new SessionMapStore(join(options.stateDir, 'sessions.json'));
+        this.log = options.log;
+        this.load();
+        this.applyAssistant(this.store.assistant);
+        this.applyWorkspace(this.store.cwd);
+        this.applyPermission(this.store.permission);
+        this.migrateAccountSettings();
+        const seen = new SeenStore(join(options.stateDir, 'seen.json'));
+        const credentials = options.ctx.credentials;
+        this.vault = credentials
+            ? createServiceVault(credentials)
+            : createFileVault(join(options.stateDir, 'secrets.json'));
+        this.engine = new ImEngine(options.ctx, this.sessions, seen, options.engineConfig, options.log, (accountId, msg) => {
+            this.requestAuthorization(accountId, msg);
+            return replyText('未授权：请管理员在设置 → IM助理 中批准你的访问。');
+        }, (accountId) => this.accountEngineConfig(accountId), (accountId) => this.store.channels[accountId]?.privateAccess === 'all' ? 'all' : 'approved', (accountId) => normalizeCommandPermissions(this.store.channels[accountId]?.commandPermissions), join(options.stateDir, 'deferred-delivery.json'));
+        for (const [channelId, users] of Object.entries(this.store.allowlist)) {
+            for (const userId of users)
+                this.engine.addAllowed(channelId, userId);
+        }
+        this.pairing = new PairingHub({
+            log: options.log,
+            onSuccess: async (id, creds) => {
+                const settings = {};
+                for (const key of Object.keys(creds).filter((key) => key.startsWith('__setting_'))) {
+                    settings[key.slice('__setting_'.length)] = key === '__setting_commandPermissions' ? JSON.parse(creds[key]) : creds[key];
+                    delete creds[key];
+                }
+                const result = await this.connect(id, creds, settings);
+                if (!result.ok)
+                    throw new Error(result.error ?? '保存失败');
+            },
+        });
+        this.flush();
+    }
+    list() {
+        return CHANNEL_ORDER.map((id) => {
+            const meta = CHANNEL_META[id];
+            const accounts = Object.entries(this.store.channels)
+                .filter(([accountId, state]) => this.platformOf(accountId, state) === id)
+                .map(([accountId, state]) => this.accountView(accountId, state));
+            const online = accounts.filter((item) => item.connected).length;
+            const first = accounts[0];
+            return {
+                id,
+                label: meta.label,
+                description: meta.description,
+                kind: meta.kind,
+                fields: meta.fields,
+                connected: online > 0,
+                receiveEnabled: accounts.some((item) => item.receiveEnabled),
+                configuredKeys: first?.configuredKeys ?? [],
+                status: accounts.length === 0 ? '未配置' : `${online}/${accounts.length} 在线`,
+                accounts,
+                online,
+                total: accounts.length,
+            };
+        });
+    }
+    accountView(accountId, state) {
+        const platform = this.platformOf(accountId, state);
+        const config = state.config ?? {};
+        const adapter = this.running.get(accountId);
+        let status = state.receiveEnabled === false ? '已停止' : state.lastError ?? (state.enabled ? '未连接' : '已停止');
+        try {
+            if (adapter)
+                status = adapter.status();
+        }
+        catch {
+            // 状态读取失败不能影响其他账号，也不向浏览器泄露 SDK 异常。
+            status = '状态读取失败';
+        }
+        const runtimeState = connectionState(status);
+        const connected = adapter !== undefined && runtimeState === 'connected';
+        const nameOrdinal = this.stableNameOrdinal(platform, state);
+        const canonicalName = autoAccountName(platform, nameOrdinal);
+        const name = String(state.name || canonicalName).trim();
+        const autoName = name === canonicalName || name === channelAutoPrefix(platform);
+        return {
+            id: accountId,
+            platform,
+            name,
+            autoName,
+            nameOrdinal,
+            connected,
+            connectionState: runtimeState,
+            receiveConfigured: state.receiveEnabled !== false,
+            receiveEnabled: connected && state.receiveEnabled !== false,
+            configuredKeys: Object.keys(config).filter((key) => Boolean(config[key]) && !key.endsWith('Ref')),
+            status,
+            assistant: normalizeAssistantModel(state.assistant ?? {}) ?? this.currentAssistant(),
+            cwd: normalizeWorkspacePath(state.cwd) ?? this.currentWorkspace(),
+            permission: normalizePermission(state.permission, this.permissionPresets().names) ?? this.currentPermission(),
+            agentPreset: state.agentPreset || this.engineConfig.agentPreset || 'standard',
+            commandPermissions: normalizeCommandPermissions(state.commandPermissions),
+            privateAccess: state.privateAccess === 'all' ? 'all' : 'approved',
+            sendMode: normalizeSendMode(state.sendMode),
+            lastCheckedAt: state.lastCheckedAt,
+        };
+    }
+    channelSessions() {
+        const archived = this.archivedSessionIds();
+        const groups = new Map(CHANNEL_ORDER.map(id => [id, {
+                id,
+                label: CHANNEL_META[id].label,
+                sessions: [],
+            }]));
+        for (const item of this.sessions.list()) {
+            if (archived.has(item.sessionId))
+                continue;
+            groups.get(this.platformOf(item.channel, this.store.channels[item.channel]))?.sessions.push(item);
+        }
+        return [...groups.values()].filter((group) => group.sessions.length > 0);
+    }
+    archivedSessionIds() {
+        try {
+            const registry = this.ctx.get?.('workspaceRegistry');
+            const ids = registry?.archivedSessionIds;
+            if (!ids)
+                return new Set();
+            return new Set([...ids].map((id) => String(id)));
+        }
+        catch {
+            return new Set();
+        }
+    }
+    async connect(id, config, settings) {
+        if (!CHANNEL_META[id])
+            return { ok: false, error: '未知渠道' };
+        const accountId = this.accountIdFor(id, config ?? {});
+        return this.channelOperations.run(accountId, () => this.connectNow(id, accountId, config, settings ?? {}));
+    }
+    async connectNow(id, accountId, config, settings = {}) {
+        const incoming = { ...(config ?? {}) };
+        const existed = Boolean(this.store.channels[accountId]);
+        const hadAnotherIdentity = !existed && Object.entries(this.store.channels)
+            .some(([existingId, state]) => existingId !== accountId && this.platformOf(existingId, state) === id);
+        const prev = this.store.channels[accountId] ?? {};
+        if (['qq', 'wecom', 'dingtalk'].includes(id)) {
+            const hosts = Object.hasOwn(incoming, 'additionalImageHosts') ? incoming.additionalImageHosts : prev.config?.additionalImageHosts;
+            try {
+                if (hosts !== undefined)
+                    incoming.additionalImageHosts = parseAdditionalImageHosts(hosts).join('\n');
+            }
+            catch {
+                return { ok: false, error: '图片扩展主机配置无效：请填写精确域名，不要包含通配符、URL、端口或 IP 地址。' };
+            }
+        }
+        const normalized = await this.normalizeAccountSettings(id, settings, prev);
+        if (!normalized.ok)
+            return normalized;
+        if (id === 'weixin' && incoming.botToken) {
+            await this.vault.set(credentialRef(accountId, 'botToken'), incoming.botToken);
+            persistWeixinLogin(this.accountStateDir(accountId, id), {
+                allowedUserId: incoming.allowedUserId,
+                baseUrl: incoming.baseUrl,
+            });
+            delete incoming.botToken;
+            incoming.bound = '1';
+        }
+        const nextConfig = await this.persistSecrets(id, accountId, { ...(prev.config ?? {}), ...incoming });
+        this.store.channels[accountId] = {
+            ...prev,
+            id: accountId,
+            platform: id,
+            name: normalized.settings.name,
+            nameOrdinal: normalized.settings.nameOrdinal,
+            assistant: normalized.settings.assistant,
+            cwd: normalized.settings.cwd,
+            permission: normalized.settings.permission,
+            agentPreset: normalized.settings.agentPreset,
+            commandPermissions: normalized.settings.commandPermissions,
+            privateAccess: normalized.settings.privateAccess,
+            sendMode: normalized.settings.sendMode,
+            enabled: true,
+            receiveEnabled: true,
+            config: nextConfig,
+        };
+        this.flush();
+        this.seedAllowedUser(accountId, incoming.allowedUserId || incoming.ownerOpenId || nextConfig.allowedUserId || nextConfig.ownerOpenId);
+        try {
+            await this.startOne(accountId);
+            return { ok: true, accountId, created: !existed, newIdentity: hadAnotherIdentity };
+        }
+        catch (error) {
+            this.log(`[manager] ${id} 连接失败: ${error instanceof Error ? error.message : String(error)}`);
+            return { ok: false, error: '账号连接失败，请查看本机日志', accountId, created: !existed, newIdentity: hadAnotherIdentity };
+        }
+    }
+    async setReceive(id, receiveEnabled) {
+        const accountId = this.resolveAccountId(id);
+        if (!accountId)
+            return { ok: false, error: '账号不存在' };
+        return this.channelOperations.run(accountId, () => this.setReceiveNow(accountId, receiveEnabled));
+    }
+    async setReceiveNow(id, receiveEnabled) {
+        const state = this.store.channels[id];
+        if (!state?.enabled)
+            return { ok: false, error: '渠道未配置' };
+        state.receiveEnabled = receiveEnabled;
+        this.flush();
+        if (!receiveEnabled)
+            await this.stopOne(id);
+        else if (!this.running.has(id))
+            await this.startOne(id);
+        return { ok: true };
+    }
+    async disconnect(id) {
+        const accountId = this.resolveAccountId(id);
+        if (!accountId)
+            return;
+        await this.channelOperations.run(accountId, () => this.disconnectNow(accountId));
+    }
+    async disconnectNow(id) {
+        const state = this.store.channels[id];
+        if (state) {
+            state.enabled = false;
+            state.receiveEnabled = false;
+            this.flush();
+        }
+        await this.stopOne(id);
+    }
+    async remove(id) {
+        const accountId = this.resolveAccountId(id);
+        if (!accountId)
+            return;
+        await this.channelOperations.run(accountId, () => this.removeNow(accountId));
+    }
+    async removeNow(id) {
+        await this.stopOne(id);
+        const state = this.store.channels[id];
+        if (!state)
+            return;
+        const platform = this.platformOf(id, state);
+        if (platform === 'weixin') {
+            clearWeixinLogin(this.accountStateDir(id, platform));
+            await this.vault.unset(credentialRef(id, 'botToken'));
+        }
+        for (const field of CHANNEL_META[platform].fields.filter((item) => item.secret)) {
+            const ref = state?.config?.[`${field.key}Ref`] || credentialRef(id, field.key);
+            await this.vault.unset(ref);
+        }
+        delete this.store.channels[id];
+        delete this.store.allowlist[id];
+        delete this.store.pending[id];
+        this.engine.clearAllowed(id);
+        this.flush();
+    }
+    attachMappedSessions() {
+        if (this.disposed)
+            return Promise.resolve();
+        return this.engine.attachMappedSessions();
+    }
+    async initEnabled() {
+        if (this.disposed)
+            return;
+        const started = Date.now();
+        await this.migrateLegacyWeixinToken().catch((error) => {
+            this.log(`[manager] 迁移旧版微信 token 失败，已保留原文件: ${error instanceof Error ? error.message : String(error)}`);
+        });
+        if (this.disposed)
+            return;
+        await this.clearUnsupportedReasoningEfforts();
+        for (const [id, state] of Object.entries(this.store.channels)) {
+            if (this.disposed)
+                return;
+            if (state?.enabled && state.receiveEnabled !== false) {
+                const one = Date.now();
+                await this.channelOperations.run(id, () => this.startOne(id)).catch((error) => {
+                    this.log(`[manager] 启动 ${id} 失败: ${error instanceof Error ? error.message : String(error)}`);
+                });
+                this.log(`[boot] 渠道 ${id} 启动 ${Date.now() - one}ms`);
+            }
+        }
+        this.log(`[boot] initEnabled ${Date.now() - started}ms`);
+    }
+    registerApi(ctx) {
+        const webServer = ctx.webServer;
+        if (!webServer)
+            return;
+        const send = (res, status, body) => {
+            res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+            res.end(JSON.stringify(body));
+        };
+        const readJson = async (req) => {
+            const { body, oversized, invalidJson } = await readApiJsonBody(req);
+            if (oversized)
+                throw new ApiRequestError(413, '请求体超过 1MB 上限');
+            if (invalidJson)
+                throw new ApiRequestError(400, '请求体不是合法 JSON');
+            return body;
+        };
+        const dispatch = async (method, path, readBody, send) => {
+            const payload = () => ({
+                ok: true,
+                channels: this.list(),
+                groups: this.channelSessions(),
+                pending: this.pendingRequests(),
+                assistant: this.currentAssistant(),
+            });
+            try {
+                // 路由段统一从插件前缀之后开始，身份认证只由下方入口负责。
+                const parts = ('/dsh-im-connect/api' + path).split('/').filter(Boolean);
+                if (parts[2] === 'assistant' && parts.length === 3) {
+                    if (method === 'GET') {
+                        send(200, {
+                            ok: true,
+                            assistant: this.currentAssistant(),
+                            cwd: this.currentWorkspace(),
+                            permission: this.currentPermission(),
+                            permissions: this.permissionOptions(),
+                            agentPresets: await this.agentPresetOptions(),
+                            agentPreset: this.engineConfig.agentPreset || 'standard',
+                            providers: await this.listModelCatalog(),
+                        });
+                        return;
+                    }
+                    if (method === 'POST') {
+                        const body = await readBody();
+                        const result = this.setAssistant(body);
+                        send(result.ok ? 200 : 400, result);
+                        return;
+                    }
+                    send(405, { ok: false, error: 'method not allowed' });
+                    return;
+                }
+                if (parts[2] === 'sessions' && parts.length === 4 && method === 'POST') {
+                    const action = parts[3];
+                    const body = await readBody();
+                    const sessionId = String(body.sessionId ?? '');
+                    if (!sessionId) {
+                        send(400, { ok: false, error: '缺少 sessionId' });
+                        return;
+                    }
+                    if (action === 'rename') {
+                        const title = String(body.title ?? '').trim();
+                        if (!title) {
+                            send(400, { ok: false, error: '缺少标题' });
+                            return;
+                        }
+                        const ok = this.engine.renameSession(sessionId, title);
+                        send(ok ? 200 : 404, ok ? { ok: true, groups: this.channelSessions() } : { ok: false, error: '会话不存在' });
+                        return;
+                    }
+                    if (action === 'remove') {
+                        const ok = await this.engine.removeSession(sessionId);
+                        send(ok ? 200 : 404, ok ? { ok: true, groups: this.channelSessions() } : { ok: false, error: '会话不存在' });
+                        return;
+                    }
+                    if (action === 'cleanup-missing') {
+                        const ok = await this.engine.cleanupMissingSession(sessionId);
+                        send(200, { ok, groups: this.channelSessions() });
+                        return;
+                    }
+                    if (action === 'ensure') {
+                        const ok = await this.engine.ensureSession(sessionId);
+                        send(ok ? 200 : 404, ok ? { ok: true, sessionId } : { ok: false, error: '会话不存在' });
+                        return;
+                    }
+                    send(404, { ok: false, error: `未知会话操作 ${action}` });
+                    return;
+                }
+                if (parts[2] === 'channels' && parts.length === 3 && method === 'GET') {
+                    send(200, payload());
+                    return;
+                }
+                if (parts[2] === 'channels' && parts.length === 6 && parts[4] === 'qr') {
+                    const id = parts[3];
+                    const action = parts[5];
+                    if (!CHANNEL_META[id]) {
+                        send(404, { ok: false, error: '未知渠道' });
+                        return;
+                    }
+                    if (!supportsQr(id)) {
+                        send(400, { ok: false, error: '该渠道不支持扫码绑定' });
+                        return;
+                    }
+                    if (action === 'status' && method === 'GET') {
+                        send(200, { ok: true, pairing: this.pairing.view(id), channel: this.list().find((item) => item.id === id) });
+                        return;
+                    }
+                    if (method !== 'POST') {
+                        send(405, { ok: false, error: 'method not allowed' });
+                        return;
+                    }
+                    const body = await readBody();
+                    if (action === 'start') {
+                        const incoming = body.settings;
+                        const workspaceError = this.workspaceSaveError(normalizeWorkspacePath(incoming?.cwd));
+                        if (workspaceError) {
+                            send(400, { ok: false, error: workspaceError });
+                            return;
+                        }
+                        const pairing = await this.pairing.start(id, pairingSettings(incoming));
+                        send(pairing.status === 'failed' ? 400 : 200, { ok: pairing.status !== 'failed', pairing, error: pairing.error });
+                        return;
+                    }
+                    if (action === 'refresh') {
+                        const pairing = await this.pairing.refresh(id);
+                        send(pairing.status === 'failed' ? 400 : 200, { ok: pairing.status !== 'failed', pairing, error: pairing.error });
+                        return;
+                    }
+                    if (action === 'cancel') {
+                        send(200, { ok: true, pairing: this.pairing.cancel(id) });
+                        return;
+                    }
+                    send(404, { ok: false, error: `未知扫码操作 ${action}` });
+                    return;
+                }
+                if (parts[2] === 'channels' && parts.length === 5 && method === 'POST') {
+                    const id = parts[3];
+                    const action = parts[4];
+                    const body = await readBody();
+                    if (action === 'connect') {
+                        const result = await this.connect(id, body.config, body.settings);
+                        send(result.ok ? 200 : 400, result.ok ? { ...result, channel: this.list().find((item) => item.id === id) } : result);
+                        return;
+                    }
+                    if (action === 'receive') {
+                        const result = await this.setReceive(id, body.receiveEnabled !== false);
+                        send(result.ok ? 200 : 400, result.ok ? { ok: true, channel: this.list().find((item) => item.id === id) } : result);
+                        return;
+                    }
+                    if (action === 'disconnect') {
+                        await this.disconnect(id);
+                        send(200, { ok: true, channel: this.list().find((item) => item.id === id) });
+                        return;
+                    }
+                    if (action === 'remove') {
+                        await this.remove(id);
+                        send(200, { ok: true, channel: this.list().find((item) => item.id === id) });
+                        return;
+                    }
+                    if (action === 'approve' || action === 'deny') {
+                        const userId = String(body.userId ?? '');
+                        if (!userId) {
+                            send(400, { ok: false, error: '缺少 userId' });
+                            return;
+                        }
+                        const accountId = this.resolveAccountId(id);
+                        if (!accountId) {
+                            send(404, { ok: false, error: '账号不存在或该渠道包含多个账号' });
+                            return;
+                        }
+                        if (action === 'approve')
+                            this.approve(accountId, userId);
+                        else
+                            this.deny(accountId, userId);
+                        send(200, { ok: true, pending: this.pendingRequests() });
+                        return;
+                    }
+                    send(404, { ok: false, error: `未知操作 ${action}` });
+                    return;
+                }
+                if (parts[2] === 'accounts' && parts.length === 5 && method === 'POST') {
+                    const accountId = parts[3];
+                    const action = parts[4];
+                    const body = await readBody();
+                    if (!this.store.channels[accountId]) {
+                        send(404, { ok: false, error: '账号不存在' });
+                        return;
+                    }
+                    if (action === 'settings') {
+                        const result = await this.updateAccount(accountId, body);
+                        send(result.ok ? 200 : 400, result);
+                        return;
+                    }
+                    if (action === 'receive') {
+                        const result = await this.setReceive(accountId, body.receiveEnabled !== false);
+                        send(result.ok ? 200 : 400, result);
+                        return;
+                    }
+                    if (action === 'reconnect') {
+                        const result = await this.reconnect(accountId);
+                        send(result.ok ? 200 : 400, result);
+                        return;
+                    }
+                    if (action === 'check') {
+                        const result = await this.checkAccount(accountId);
+                        send(result.ok ? 200 : 404, result);
+                        return;
+                    }
+                    if (action === 'remove') {
+                        await this.remove(accountId);
+                        send(200, { ok: true });
+                        return;
+                    }
+                    if (action === 'approve' || action === 'deny') {
+                        const userId = String(body.userId ?? '');
+                        if (!userId) {
+                            send(400, { ok: false, error: '缺少 userId' });
+                            return;
+                        }
+                        action === 'approve' ? this.approve(accountId, userId) : this.deny(accountId, userId);
+                        send(200, { ok: true, pending: this.pendingRequests() });
+                        return;
+                    }
+                    send(404, { ok: false, error: `未知账号操作 ${action}` });
+                    return;
+                }
+                send(404, { ok: false, error: 'not found' });
+            }
+            catch (error) {
+                // 单个路由异常不能让 HTTP 连接悬死，统一回 500 并落日志。
+                if (error instanceof ApiRequestError) {
+                    send(error.status, { ok: false, error: error.message });
+                    return;
+                }
+                const detail = error instanceof Error ? error.message : String(error);
+                this.log(`[manager] API 处理失败: ${detail}`);
+                send(500, { ok: false, error: '操作失败，请查看本机日志' });
+            }
+        };
+        const basePath = '/api/dsh-im-connect';
+        const dispose = webServer.register({
+            kind: 'prefix',
+            path: basePath,
+            handler: async (req, res) => {
+                try {
+                    // 动态读取活动服务，并保留 requestRejection 的 this 绑定。
+                    const connection = (typeof ctx.get === 'function' ? ctx.get('connection') : undefined);
+                    if (typeof connection?.requestRejection !== 'function') {
+                        send(res, 503, { ok: false, error: '宿主认证服务尚未就绪或版本不支持；请稍后重试或升级宿主。 / Retry or upgrade DSH to enable authenticated management.' });
+                        return;
+                    }
+                    const rejection = connection.requestRejection(req);
+                    if (rejection !== undefined) {
+                        send(res, rejection, { ok: false, error: rejection === 401 ? '请先登录 DSH / Sign in to DSH first' : '宿主拒绝此 Host 或跨站请求 / Host or cross-site request forbidden' });
+                        return;
+                    }
+                    const requestError = validateApiMutation(req);
+                    if (requestError) {
+                        send(res, requestError.status, { ok: false, error: requestError.error });
+                        return;
+                    }
+                    const url = new URL(req.url ?? '/', 'http://localhost');
+                    if (url.pathname !== basePath && !url.pathname.startsWith(basePath + '/')) {
+                        send(res, 404, { ok: false, error: 'not found' });
+                        return;
+                    }
+                    await dispatch(req.method ?? 'GET', url.pathname.slice(basePath.length), () => readJson(req), (status, body) => send(res, status, body));
+                }
+                catch (error) {
+                    this.log(`[manager] API 认证失败: ${error instanceof Error ? error.message : String(error)}`);
+                    send(res, 500, { ok: false, error: '操作失败，请查看本机日志' });
+                }
+            },
+        });
+        if (typeof dispose === 'function')
+            this.apiDisposers.push(dispose);
+        this.log('[manager] API 已注册 /api/dsh-im-connect');
+    }
+    disposeApi() {
+        this.disposed = true;
+        this.diagnosticAbort.abort();
+        for (const dispose of this.apiDisposers)
+            dispose();
+        this.apiDisposers = [];
+        this.pairing.dispose();
+        const activeIds = new Set([...this.running.keys(), ...this.channelOperations.keys()]);
+        for (const id of activeIds)
+            void this.channelOperations.run(id, () => this.stopOne(id));
+        this.engine.dispose();
+    }
+    currentAssistant() {
+        return normalizeAssistantModel(this.store.assistant ?? this.engineConfig);
+    }
+    async updateAccount(accountId, input) {
+        if (!this.store.channels[accountId])
+            return { ok: false, error: '账号不存在' };
+        return this.channelOperations.run(accountId, async () => {
+            const state = this.store.channels[accountId];
+            if (!state)
+                return { ok: false, error: '账号不存在' };
+            const platform = this.platformOf(accountId, state);
+            const normalized = await this.normalizeAccountSettings(platform, input, state);
+            if (!normalized.ok)
+                return normalized;
+            const previousCwd = normalizeWorkspacePath(state.cwd) ?? this.currentWorkspace();
+            const previousPreset = state.agentPreset || this.engineConfig.agentPreset || 'standard';
+            const presetChanged = previousPreset !== normalized.settings.agentPreset;
+            if (presetChanged) {
+                for (const record of this.sessions.list().filter(item => item.channel === accountId && !item.adopted && !item.agentPreset)) {
+                    this.sessions.updateSession({ ...record, agentPreset: previousPreset });
+                }
+            }
+            const resetSessions = presetChanged || !sameWorkspacePath(previousCwd, normalized.settings.cwd);
+            const reloadSessions = resetSessions
+                || !sameAssistantModel(state.assistant, normalized.settings.assistant)
+                || state.permission !== normalized.settings.permission;
+            state.name = normalized.settings.name;
+            state.nameOrdinal = normalized.settings.nameOrdinal;
+            state.assistant = normalized.settings.assistant;
+            state.cwd = normalized.settings.cwd;
+            state.agentPreset = normalized.settings.agentPreset;
+            state.permission = normalized.settings.permission;
+            state.commandPermissions = normalized.settings.commandPermissions;
+            state.privateAccess = normalized.settings.privateAccess;
+            // 发送方式按注入时机读取，不需要重载会话。
+            state.sendMode = normalized.settings.sendMode;
+            this.flush();
+            if (reloadSessions)
+                await this.engine.reloadChannel(accountId, { resetSessions });
+            return { ok: true, account: this.accountView(accountId, state) };
+        });
+    }
+    /** 查询平台或现有连接心跳；同账号合并请求，总等待 12 秒，不启动接收器。 */
+    checkAccount(accountId) {
+        const existing = this.diagnosticJobs.get(accountId);
+        if (existing)
+            return existing;
+        const job = this.channelOperations.run(accountId, async () => {
+            const state = this.store.channels[accountId];
+            if (!state)
+                return { ok: false, error: '账号不存在' };
+            if (this.disposed)
+                return { ok: false, error: '操作失败，请查看本机日志' };
+            const signal = AbortSignal.any([AbortSignal.timeout(12_000), this.diagnosticAbort.signal]);
+            let checks = [];
+            const preparation = await probe('credentials', signal, async () => {
+                let adapter = this.running.get(accountId);
+                if (!adapter) {
+                    try {
+                        const platform = this.platformOf(accountId, state);
+                        const resolved = await fileOperation(this.resolveSecrets(platform, accountId, state.config ?? {}), signal);
+                        signal.throwIfAborted();
+                        adapter = createChannelAdapter(platform, resolved, this.log, this.accountStateDir(accountId, platform), { host: this.ctx });
+                    }
+                    catch (error) {
+                        signal.throwIfAborted();
+                        if (error instanceof DiagnosticError)
+                            throw error;
+                        throw new DiagnosticError('local-state');
+                    }
+                }
+                if (!adapter)
+                    throw new DiagnosticError('auth');
+                if (!adapter.diagnose)
+                    throw new DiagnosticError('unsupported');
+                checks = await fileOperation(adapter.diagnose(signal), signal);
+            });
+            if (preparation.status !== 'passed')
+                checks = [preparation];
+            if (this.disposed)
+                return { ok: false, error: '操作失败，请查看本机日志' };
+            const checkedAt = new Date().toISOString();
+            const previous = state.lastCheckedAt;
+            state.lastCheckedAt = checkedAt;
+            try {
+                this.flush();
+            }
+            catch (error) {
+                state.lastCheckedAt = previous;
+                throw error;
+            }
+            return { ok: true, account: this.accountView(accountId, state), diagnostics: { version: 1, checkedAt, checks } };
+        });
+        this.diagnosticJobs.set(accountId, job);
+        void job.finally(() => { if (this.diagnosticJobs.get(accountId) === job)
+            this.diagnosticJobs.delete(accountId); }).catch(() => undefined);
+        return job;
+    }
+    async reconnect(accountId) {
+        if (!this.store.channels[accountId])
+            return { ok: false, error: '账号不存在' };
+        return this.channelOperations.run(accountId, async () => {
+            try {
+                const state = this.store.channels[accountId];
+                state.enabled = true;
+                state.receiveEnabled = true;
+                await this.startOne(accountId);
+                return { ok: true };
+            }
+            catch {
+                return { ok: false, error: '重新连接失败，请查看本机日志' };
+            }
+        });
+    }
+    setAssistant(input) {
+        const hasModel = input.provider !== undefined || input.model !== undefined;
+        const hasWorkspace = input.cwd !== undefined;
+        const hasPermission = input.permission !== undefined;
+        if (!hasModel && !hasWorkspace && !hasPermission)
+            return { ok: false, error: '请选择提供商、模型、工作区或权限' };
+        const nextAssistant = hasModel ? normalizeAssistantModel(input) : undefined;
+        if (hasModel && !nextAssistant)
+            return { ok: false, error: '请选择提供商和模型' };
+        const nextCwd = hasWorkspace ? normalizeWorkspacePath(input.cwd) : undefined;
+        if (hasWorkspace && !nextCwd)
+            return { ok: false, error: '请选择工作区' };
+        const nextPermission = hasPermission ? normalizePermission(input.permission, this.permissionPresets().names) : undefined;
+        if (hasPermission && !nextPermission)
+            return { ok: false, error: '请选择权限' };
+        if (hasModel) {
+            const next = nextAssistant;
+            this.store.assistant = next;
+            this.applyAssistant(next);
+            this.engine.setModel(next.provider, next.model, next.reasoningEffort);
+            this.log(`[manager] 助手模型已设为 ${next.provider}/${next.model}`);
+        }
+        if (hasWorkspace) {
+            const cwd = nextCwd;
+            this.store.cwd = cwd;
+            this.applyWorkspace(cwd);
+            this.log(`[manager] 工作区已设为 ${cwd}`);
+        }
+        if (hasPermission) {
+            const permission = nextPermission;
+            this.store.permission = permission;
+            this.applyPermission(permission);
+            this.log(`[manager] 权限已设为 ${permission}`);
+        }
+        this.flush();
+        return { ok: true, assistant: this.currentAssistant(), cwd: this.currentWorkspace(), permission: this.currentPermission() };
+    }
+    applyAssistant(assistant) {
+        const next = normalizeAssistantModel(assistant ?? {});
+        if (!next)
+            return;
+        this.engineConfig.provider = next.provider;
+        this.engineConfig.model = next.model;
+        this.engineConfig.reasoningEffort = next.reasoningEffort;
+    }
+    currentWorkspace() {
+        return this.store.cwd || this.engineConfig.cwd;
+    }
+    /** 宿主已提供工作区列表时，空列表和未登记路径都不能保存。列表不可用时保持原行为。 */
+    workspaceSaveError(cwd) {
+        const registered = this.registeredWorkspacePaths();
+        if (!registered)
+            return undefined;
+        if (registered.length === 0)
+            return '请先添加工作区';
+        if (!cwd || !registered.some(path => sameWorkspacePath(path, cwd)))
+            return '请选择工作区';
+        return undefined;
+    }
+    registeredWorkspacePaths() {
+        try {
+            const registry = this.ctx.get?.('workspaceRegistry');
+            if (typeof registry?.list !== 'function')
+                return undefined;
+            const items = registry.list();
+            if (!Array.isArray(items))
+                return undefined;
+            return items.flatMap(item => typeof item?.path === 'string' && item.path.trim() ? [item.path] : []);
+        }
+        catch {
+            return undefined;
+        }
+    }
+    applyWorkspace(cwd) {
+        const next = normalizeWorkspacePath(cwd);
+        if (!next)
+            return;
+        this.engineConfig.cwd = next;
+        // 构造阶段 engine 还没建好，先只写配置；ImEngine 会读同一份 engineConfig。
+        this.engine?.setCwd(next);
+    }
+    currentPermission() {
+        const official = this.permissionPresets();
+        return normalizePermission(this.store.permission ?? this.engineConfig.permissionPreset, official.names) ?? official.defaultPreset;
+    }
+    applyPermission(permission) {
+        const next = normalizePermission(permission, this.permissionPresets().names);
+        if (!next)
+            return;
+        this.engineConfig.permissionPreset = next;
+        this.engine?.setPermission(next);
+    }
+    permissionOptions() {
+        const official = this.permissionPresets();
+        return official.names.map((name) => official.optionOf(name));
+    }
+    permissionPresets() {
+        return this.ctx.permissionPresets;
+    }
+    async listModelCatalog() {
+        const llm = this.ctx.get?.('llm');
+        const providers = llm?.listProviders?.() ?? [];
+        const out = [];
+        for (const item of providers) {
+            const models = llm?.listModels ? await llm.listModels(item.id).catch(() => []) : [];
+            out.push({
+                id: item.id,
+                name: item.name || item.id,
+                models: await Promise.all(models.map(async (model) => {
+                    const resolved = llm?.resolveModelInfo === undefined
+                        ? undefined
+                        : await llm.resolveModelInfo(item.id, model.id).catch(() => undefined);
+                    const reasoning = resolved?.reasoning === undefined
+                        ? undefined
+                        : {
+                            efforts: resolved.reasoning.efforts.map((effort) => ({
+                                id: effort.id,
+                                name: effort.name,
+                                ...(effort.description === undefined ? {} : { description: effort.description }),
+                            })),
+                            ...(resolved.reasoning.defaultEffort === undefined ? {} : { defaultEffort: resolved.reasoning.defaultEffort }),
+                        };
+                    return {
+                        id: model.id,
+                        name: model.name || model.id,
+                        ...(resolved?.description ?? model.description) === undefined
+                            ? {}
+                            : { description: resolved?.description ?? model.description },
+                        ...(reasoning === undefined ? {} : { reasoning }),
+                    };
+                })),
+            });
+        }
+        return out;
+    }
+    async startOne(id) {
+        await this.stopOne(id);
+        if (this.disposed)
+            return;
+        const state = this.store.channels[id];
+        if (!state)
+            throw new Error('账号不存在');
+        const platform = this.platformOf(id, state);
+        if (id === 'weixin')
+            await this.migrateLegacyWeixinToken();
+        const resolved = await this.resolveSecrets(platform, id, state.config ?? {});
+        if (this.disposed)
+            return;
+        const accountDir = this.accountStateDir(id, platform);
+        const adapter = createChannelAdapter(platform, resolved, this.log, accountDir, {
+            accountId: id,
+            accountLabel: state.name || `${CHANNEL_META[platform].label}账号`,
+            host: this.ctx,
+            onWeixinBotToken: async (token) => {
+                const ref = credentialRef(id, 'botToken');
+                if (token)
+                    await this.vault.set(ref, token);
+                else
+                    await this.vault.unset(ref);
+            },
+        });
+        if (!adapter)
+            throw new Error('凭据不足，无法启动渠道');
+        if (platform === 'weixin') {
+            this.seedAllowedUser(id, readWeixinAllowedUserId(accountDir) || resolved.allowedUserId);
+        }
+        this.seedAllowedUser(id, resolved.ownerOpenId || resolved.allowedUserId);
+        this.engine.register(adapter);
+        this.running.set(id, adapter);
+        // 渠道网络异常时 start 可能永久挂起，超时按启动失败处理（catch 会顺带 stop）
+        const START_TIMEOUT_MS = 30_000;
+        let startTimer;
+        try {
+            await Promise.race([
+                adapter.start(),
+                new Promise((_, reject) => {
+                    startTimer = setTimeout(() => reject(new Error('渠道启动超时')), START_TIMEOUT_MS);
+                }),
+            ]);
+            if (this.disposed) {
+                this.engine.unregister(id);
+                this.running.delete(id);
+                await Promise.resolve(adapter.stop()).catch(() => undefined);
+                return;
+            }
+        }
+        catch (error) {
+            this.engine.unregister(id);
+            this.running.delete(id);
+            await Promise.resolve(adapter.stop()).catch(() => undefined);
+            const message = error instanceof Error ? error.message : String(error);
+            if (state) {
+                state.lastError = '连接失败，请查看本机日志';
+                this.flush();
+            }
+            throw error;
+        }
+        finally {
+            if (startTimer)
+                clearTimeout(startTimer);
+        }
+        if (state) {
+            state.lastError = undefined;
+            this.flush();
+        }
+        this.log(`[manager] ${id} 已启动：${adapter.status()}`);
+    }
+    async stopOne(id) {
+        const adapter = this.running.get(id);
+        if (!adapter)
+            return;
+        this.engine.unregister(id);
+        this.running.delete(id);
+        await Promise.resolve(adapter.stop()).catch(() => undefined);
+    }
+    async persistSecrets(platform, id, config) {
+        const secrets = new Set((CHANNEL_META[platform].fields.filter((field) => field.secret)).map((field) => field.key));
+        const out = { ...config };
+        for (const key of secrets) {
+            const value = out[key];
+            if (!value)
+                continue;
+            const ref = credentialRef(id, key);
+            await this.vault.set(ref, value);
+            out[key] = '';
+            out[`${key}Ref`] = ref;
+        }
+        return out;
+    }
+    async resolveSecrets(platform, id, config) {
+        const secrets = new Set((CHANNEL_META[platform].fields.filter((field) => field.secret)).map((field) => field.key));
+        const out = { ...config };
+        for (const key of secrets) {
+            const ref = out[`${key}Ref`] || credentialRef(id, key);
+            const value = await this.vault.resolve(ref);
+            if (value)
+                out[key] = value;
+        }
+        if (platform === 'weixin') {
+            const token = await this.vault.resolve(credentialRef(id, 'botToken'));
+            if (token)
+                out.botToken = token;
+        }
+        return out;
+    }
+    async migrateLegacyWeixinToken() {
+        const dir = join(this.stateDir, 'weixin');
+        const token = readLegacyWeixinBotToken(dir);
+        if (!token)
+            return;
+        await this.vault.set(credentialRef('weixin', 'botToken'), token);
+        // 只有 vault 写入成功后才重写旧文件，避免迁移失败导致登录态丢失。
+        persistWeixinLogin(dir, {});
+        this.log('[manager] 已把旧版微信明文 token 迁移到凭据服务');
+    }
+    load() {
+        try {
+            const value = JSON.parse(readFileSync(this.file, 'utf8'));
+            if (value === null || typeof value !== 'object' || Array.isArray(value))
+                throw new TypeError('channels.json 顶层必须是对象');
+            const parsed = value;
+            this.store = {
+                version: 2,
+                channels: parsed.channels ?? {},
+                allowlist: parsed.allowlist ?? {},
+                pending: parsed.pending ?? {},
+                assistant: normalizeAssistantModel(parsed.assistant ?? {}),
+                cwd: normalizeWorkspacePath(parsed.cwd),
+                permission: normalizePermission(parsed.permission),
+            };
+        }
+        catch (error) {
+            try {
+                const backup = backupCorruptConfig(this.file);
+                if (backup)
+                    this.log(`[manager] channels.json 损坏，已备份到 ${backup}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+            catch (backupError) {
+                this.log(`[manager] channels.json 无法读取且备份失败，拒绝覆盖原文件: ${backupError instanceof Error ? backupError.message : String(backupError)}`);
+                throw backupError;
+            }
+            this.store = { channels: {}, allowlist: {}, pending: {} };
+        }
+    }
+    migrateAccountSettings() {
+        const assistant = this.currentAssistant() ?? { provider: this.engineConfig.provider, model: this.engineConfig.model };
+        const cwd = this.currentWorkspace();
+        const permission = this.currentPermission();
+        for (const [id, state] of Object.entries(this.store.channels)) {
+            const platform = this.platformOf(id, state);
+            state.id = id;
+            state.platform = platform;
+            state.name = String(state.name || `${CHANNEL_META[platform].label}账号`).trim();
+            state.assistant = normalizeAssistantModel(state.assistant ?? {}) ?? assistant;
+            state.cwd = normalizeWorkspacePath(state.cwd) ?? cwd;
+            state.permission = normalizePermission(state.permission, this.permissionPresets().names) ?? permission;
+            state.privateAccess = state.privateAccess === 'all' ? 'all' : 'approved';
+            state.sendMode = normalizeSendMode(state.sendMode);
+        }
+        this.store.version = 2;
+    }
+    async clearUnsupportedReasoningEfforts() {
+        const llm = this.ctx.get?.('llm');
+        if (!llm?.resolveModelInfo)
+            return;
+        let changed = false;
+        await Promise.all(Object.entries(this.store.channels).map(async ([id, state]) => {
+            const assistant = normalizeAssistantModel(state.assistant ?? {});
+            if (!assistant?.reasoningEffort)
+                return;
+            const resolved = await llm.resolveModelInfo(assistant.provider, assistant.model).catch(() => undefined);
+            if (resolved === undefined || resolved.reasoning !== undefined)
+                return;
+            state.assistant = { provider: assistant.provider, model: assistant.model };
+            changed = true;
+            this.log(`[manager] 已清理 ${id} 的无效推理等级 ${assistant.reasoningEffort}`);
+        }));
+        if (changed)
+            this.flush();
+    }
+    stableNameOrdinal(platform, previous) {
+        if (Number.isInteger(previous.nameOrdinal) && (previous.nameOrdinal ?? 0) >= 1)
+            return previous.nameOrdinal;
+        const parsed = parseAutoOrdinal(platform, previous.name);
+        if (parsed)
+            return parsed;
+        const used = new Set();
+        for (const [id, state] of Object.entries(this.store.channels)) {
+            if (state === previous || this.platformOf(id, state) !== platform)
+                continue;
+            const ordinal = Number.isInteger(state.nameOrdinal) && (state.nameOrdinal ?? 0) >= 1
+                ? state.nameOrdinal
+                : parseAutoOrdinal(platform, state.name);
+            if (ordinal)
+                used.add(ordinal);
+        }
+        let ordinal = 1;
+        while (used.has(ordinal))
+            ordinal += 1;
+        return ordinal;
+    }
+    async normalizeAccountSettings(platform, input, previous) {
+        const agentPreset = input.agentPreset ?? previous.agentPreset ?? this.engineConfig.agentPreset ?? 'standard';
+        if (typeof agentPreset !== 'string' || !agentPreset.trim())
+            return { ok: false, error: '请选择 Agent 预设' };
+        if (input.agentPreset !== undefined) {
+            const options = await this.agentPresetOptions();
+            const selected = options.find(item => item.id === agentPreset);
+            if (!selected || selected.broken)
+                return { ok: false, error: 'Agent 预设不存在或不可用' };
+        }
+        const fallback = this.currentAssistant();
+        const assistant = normalizeAssistantModel({
+            provider: input.provider ?? previous.assistant?.provider ?? fallback?.provider,
+            model: input.model ?? previous.assistant?.model ?? fallback?.model,
+            reasoningEffort: input.reasoningEffort !== undefined ? input.reasoningEffort : previous.assistant?.reasoningEffort,
+        });
+        if (!assistant)
+            return { ok: false, error: '请选择提供商和模型' };
+        const cwd = normalizeWorkspacePath(input.cwd ?? previous.cwd ?? this.currentWorkspace());
+        const workspaceError = this.workspaceSaveError(cwd);
+        if (workspaceError)
+            return { ok: false, error: workspaceError };
+        if (!cwd)
+            return { ok: false, error: '请选择工作区' };
+        const permission = normalizePermission(input.permission ?? previous.permission ?? this.currentPermission(), this.permissionPresets().names);
+        if (!permission)
+            return { ok: false, error: '请选择权限' };
+        const privateAccess = input.privateAccess === 'all' || (input.privateAccess === undefined && previous.privateAccess === 'all') ? 'all' : 'approved';
+        const sendMode = normalizeSendMode(input.sendMode === undefined ? previous.sendMode : input.sendMode);
+        let commandPermissions;
+        try {
+            commandPermissions = normalizeCommandPermissions(input.commandPermissions === undefined ? previous.commandPermissions : input.commandPermissions);
+        }
+        catch {
+            return { ok: false, error: '命令权限配置无效' };
+        }
+        const nameOrdinal = this.stableNameOrdinal(platform, previous);
+        const requested = input.name !== undefined ? String(input.name) : String(previous.name ?? '');
+        const trimmed = requested.trim();
+        if ([...trimmed].length > ACCOUNT_REMARK_LIMIT)
+            return { ok: false, error: `账号备注不能超过 ${ACCOUNT_REMARK_LIMIT} 个字符` };
+        if (/[\u0000-\u001F\u007F]/.test(trimmed))
+            return { ok: false, error: '账号备注不能包含换行或控制字符' };
+        const name = trimmed || autoAccountName(platform, nameOrdinal);
+        return { ok: true, settings: { name, nameOrdinal, assistant, agentPreset, cwd, permission, privateAccess, sendMode, commandPermissions } };
+    }
+    accountIdFor(platform, config) {
+        const identityKeys = { weixin: 'allowedUserId', wecom: 'botId', qq: 'appId', dingtalk: 'clientId', feishu: 'appId', lark: 'appId' };
+        const identity = config[identityKeys[platform] ?? ''] || config.ownerOpenId || config.botToken || config.token;
+        if (identity) {
+            for (const [accountId, state] of Object.entries(this.store.channels)) {
+                if (this.platformOf(accountId, state) !== platform)
+                    continue;
+                const key = identityKeys[platform];
+                if (key && state.config?.[key] === identity)
+                    return accountId;
+            }
+        }
+        const suffix = identity
+            ? createHash('sha256').update(`${platform}\0${identity}`).digest('hex').slice(0, 12)
+            : randomUUID().replaceAll('-', '').slice(0, 12);
+        return `${platform}_${suffix}`;
+    }
+    resolveAccountId(id) {
+        if (this.store.channels[id])
+            return id;
+        const matches = Object.entries(this.store.channels).filter(([accountId, state]) => this.platformOf(accountId, state) === id);
+        return matches.length === 1 ? matches[0][0] : undefined;
+    }
+    platformOf(accountId, state) {
+        if (state?.platform && CHANNEL_META[state.platform])
+            return state.platform;
+        const candidate = accountId.split('_', 1)[0];
+        return CHANNEL_META[candidate] ? candidate : accountId;
+    }
+    accountStateDir(accountId, platform) {
+        return accountId === platform ? join(this.stateDir, platform) : join(this.stateDir, 'accounts', accountId);
+    }
+    /** 与 Chat 使用同一预设名册，不向客户端暴露预设文件路径。 */
+    async agentPresetOptions() {
+        const presets = this.ctx.get?.('agentPresets');
+        if (presets?.remoteExportList)
+            return (await presets.remoteExportList()).presets.map(({ id, name, description, broken }) => ({ id, name, description, broken }));
+        return [{ id: this.engineConfig.agentPreset || 'standard' }];
+    }
+    accountEngineConfig(accountId) {
+        const state = this.store.channels[accountId];
+        if (!state)
+            return this.engineConfig;
+        const assistant = normalizeAssistantModel(state.assistant ?? {});
+        return {
+            ...this.engineConfig,
+            agentPreset: state.agentPreset || this.engineConfig.agentPreset,
+            cwd: normalizeWorkspacePath(state.cwd) ?? this.engineConfig.cwd,
+            provider: assistant?.provider ?? this.engineConfig.provider,
+            model: assistant?.model ?? this.engineConfig.model,
+            reasoningEffort: assistant?.reasoningEffort,
+            permissionPreset: normalizePermission(state.permission, this.permissionPresets().names) ?? this.engineConfig.permissionPreset,
+            sendMode: normalizeSendMode(state.sendMode),
+        };
+    }
+    pendingRequests() {
+        return Object.entries(this.store.pending).flatMap(([channelId, list]) => list.map((item) => ({ channelId, ...item })));
+    }
+    approve(id, userId) {
+        const uid = userId.trim();
+        const accountId = this.resolveAccountId(id);
+        if (!uid || !accountId)
+            return false;
+        const list = this.store.allowlist[accountId] ?? [];
+        if (!list.includes(uid))
+            list.push(uid);
+        this.store.allowlist[accountId] = list;
+        this.store.pending[accountId] = (this.store.pending[accountId] ?? []).filter((item) => item.userId !== uid);
+        this.engine.addAllowed(accountId, uid);
+        this.flush();
+        return true;
+    }
+    deny(id, userId) {
+        const uid = userId.trim();
+        const accountId = this.resolveAccountId(id);
+        if (!uid || !accountId)
+            return false;
+        this.store.pending[accountId] = (this.store.pending[accountId] ?? []).filter((item) => item.userId !== uid);
+        this.flush();
+        return true;
+    }
+    seedAllowedUser(id, userId) {
+        const uid = userId?.trim();
+        if (!uid)
+            return;
+        this.approve(id, uid);
+    }
+    requestAuthorization(channelId, msg) {
+        const userId = msg.userId?.trim();
+        if (!userId)
+            return;
+        const list = this.store.pending[channelId] ?? [];
+        if (!list.some((item) => item.userId === userId)) {
+            list.push({ userId, username: msg.username, chatId: msg.chatId, time: Date.now() });
+            this.store.pending[channelId] = list;
+            this.flush();
+        }
+    }
+    flush() {
+        writeFileAtomicSync(this.file, `${JSON.stringify(this.store, null, 2)}\n`);
+    }
+}
+function pairingSettings(input) {
+    if (!input)
+        return {};
+    const out = {};
+    if (input.commandPermissions !== undefined)
+        out.__setting_commandPermissions = JSON.stringify(normalizeCommandPermissions(input.commandPermissions));
+    for (const key of ['name', 'provider', 'model', 'reasoningEffort', 'cwd', 'permission', 'privateAccess', 'sendMode', 'agentPreset']) {
+        const value = input[key];
+        if (value !== undefined && value !== null)
+            out[`__setting_${key}`] = String(value);
+    }
+    return out;
+}
+function sameAssistantModel(left, right) {
+    return left?.provider === right.provider
+        && left.model === right.model
+        && left.reasoningEffort === right.reasoningEffort;
+}

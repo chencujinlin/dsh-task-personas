@@ -1,0 +1,105 @@
+import type { ChannelAdapter } from '../engine/types.js';
+export interface SlackSocketEvent {
+    data?: unknown;
+    code?: number;
+    reason?: string;
+}
+export interface SlackSocket {
+    addEventListener(type: string, listener: (event: SlackSocketEvent) => void): void;
+    send(data: string): void;
+    close(code?: number, reason?: string): void;
+}
+export interface SlackConfig {
+    token?: string;
+    appToken?: string;
+    /** 账号状态目录，用于恢复已参与线程；不配置时只保留当前适配器内存记录。 */
+    stateDir?: string;
+    host?: {
+        get(name: string): unknown;
+    };
+    fetchImpl?: typeof fetch;
+    createWebSocket?: (url: string) => SlackSocket;
+    apiBase?: string;
+    connectTimeoutMs?: number;
+}
+interface SlackFile {
+    id?: string;
+    name?: string;
+    mimetype?: string;
+    size?: number;
+    url_private?: string;
+    url_private_download?: string;
+}
+interface SlackEvent {
+    type?: string;
+    subtype?: string;
+    hidden?: boolean;
+    channel?: string;
+    channel_type?: string;
+    user?: string;
+    username?: string;
+    bot_id?: string;
+    text?: string;
+    ts?: string;
+    thread_ts?: string;
+    files?: SlackFile[];
+}
+interface SlackAction {
+    action_id?: string;
+    value?: string;
+}
+interface SlackInteraction {
+    type?: string;
+    user?: {
+        id?: string;
+        username?: string;
+        name?: string;
+    };
+    channel?: {
+        id?: string;
+        name?: string;
+    };
+    message?: {
+        ts?: string;
+        thread_ts?: string;
+    };
+    container?: {
+        channel_id?: string;
+        thread_ts?: string;
+    };
+    actions?: SlackAction[];
+}
+/** 解析后的收件目标：chatId 里用 `~` 带上线程根，回复才能落在原线程。 */
+export interface SlackRoute {
+    chatId: string;
+    channel: string;
+    threadTs?: string;
+    kind: 'dm' | 'group';
+    addressed: boolean;
+    userId: string;
+    username?: string;
+    text: string;
+    messageId: string;
+    actionToken?: string;
+    threadKey?: string;
+}
+/** chatId 是渠道不透明标识：频道号 + 线程根。 */
+export declare function slackChatId(channel: string, threadTs?: string): string;
+export declare function parseSlackChatId(chatId: string): {
+    channel: string;
+    threadTs?: string;
+};
+export declare function slackChatKind(channelId: string, channelName?: string): 'dm' | 'group';
+export declare function slackSocketUrl(value: unknown): string;
+export declare function normalizeSlackCommand(text: string): string;
+/**
+ * 事件 → 收件目标。返回 undefined 表示这条事件不该驱动 agent。
+ * 频道消息在「被 @」、所在线程已经参与过，或用 ! / 全角斜杠发出已知命令时算被呼叫。
+ */
+export declare function slackRoute(event: SlackEvent, botUserId: string, knownThreads?: {
+    has(key: string): boolean;
+}): SlackRoute | undefined;
+/** 卡片按钮回调 → 收件目标。 */
+export declare function slackActionRoute(payload: SlackInteraction): SlackRoute | undefined;
+export declare function createSlackChannel(config: SlackConfig, log: (line: string) => void): ChannelAdapter | undefined;
+export {};
